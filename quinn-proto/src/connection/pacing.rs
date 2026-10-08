@@ -13,6 +13,8 @@ use tracing::warn;
 /// than one congestion window per RTT, as recommended in
 /// <https://tools.ietf.org/html/draft-ietf-quic-recovery-34#section-7.7>
 pub(super) struct Pacer {
+    /// Fixed rate (bytes per second) requested by the congestion controller, if any
+    rate: Option<u64>,
     capacity: u64,
     last_window: u64,
     last_mtu: u16,
@@ -25,12 +27,48 @@ impl Pacer {
     pub(super) fn new(smoothed_rtt: Duration, window: u64, mtu: u16, now: Instant) -> Self {
         let capacity = optimal_capacity(smoothed_rtt, window, mtu);
         Self {
+            rate: None,
             capacity,
             last_window: window,
             last_mtu: mtu,
             tokens: capacity,
             prev: now,
         }
+    }
+
+    /// Use a fixed pacing rate (bytes per second) instead of deriving it from the window
+    pub(super) fn set_rate(&mut self, rate: Option<u64>) {
+        self.rate = rate.filter(|rate| *rate > 0);
+    }
+
+    /// Token bucket pacing at a fixed `rate`
+    ///
+    /// The bucket holds `max(4 ms of data, MIN_BURST_SIZE packets)` and refills at exactly `rate`.
+    fn delay_at_rate(
+        &mut self,
+        rate: u64,
+        bytes_to_send: u64,
+        mtu: u16,
+        now: Instant,
+    ) -> Option<Instant> {
+        let capacity = ((u128::from(rate) * FIXED_RATE_BURST_NANOS / 1_000_000_000) as u64)
+            .max(MIN_BURST_SIZE * u64::from(mtu));
+        self.capacity = capacity;
+        self.last_mtu = mtu;
+        self.tokens = self.tokens.min(capacity);
+
+        let elapsed = now.checked_duration_since(self.prev).unwrap_or_default();
+        let refill = (u128::from(rate) * elapsed.as_nanos() / 1_000_000_000) as u64;
+        self.tokens = self.tokens.saturating_add(refill).min(capacity);
+        self.prev = now;
+        if self.tokens >= bytes_to_send {
+            return None;
+        }
+        let missing = u128::from(bytes_to_send - self.tokens);
+        let nanos = (missing * 1_000_000_000).div_ceil(u128::from(rate));
+        let wait = Duration::from_nanos(nanos.min(u128::from(u64::MAX)) as u64)
+            .max(FIXED_RATE_MIN_DELAY);
+        Some(now + wait)
     }
 
     /// Record that a packet has been transmitted.
@@ -57,6 +95,10 @@ impl Pacer {
             window, 0,
             "zero-sized congestion control window is nonsense"
         );
+
+        if let Some(rate) = self.rate {
+            return self.delay_at_rate(rate, bytes_to_send, mtu, now);
+        }
 
         if window != self.last_window || mtu != self.last_mtu {
             self.capacity = optimal_capacity(smoothed_rtt, window, mtu);
@@ -144,6 +186,12 @@ fn optimal_capacity(smoothed_rtt: Duration, window: u64, mtu: u16) -> u64 {
 /// more applicable.
 const BURST_INTERVAL_NANOS: u128 = 2_000_000; // 2ms
 
+/// Burst allowed by a fixed-rate controller: 4 ms worth of data
+const FIXED_RATE_BURST_NANOS: u128 = 4_000_000;
+
+/// Shortest wait of a fixed-rate controller, so framework timers with 1 ms precision still work
+const FIXED_RATE_MIN_DELAY: Duration = Duration::from_millis(1);
+
 /// Allows some usage of GSO, and doesn't slow down the handshake.
 const MIN_BURST_SIZE: u64 = 10;
 
@@ -153,6 +201,35 @@ const MAX_BURST_SIZE: u64 = 256;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_rate_paces_at_exactly_the_rate() {
+        let mtu = 1200u16;
+        let rate = 1_250_000u64; // 10 Mbit/s
+        let start = Instant::now();
+        let mut pacer = Pacer::new(Duration::from_millis(50), 100_000, mtu, start);
+        pacer.set_rate(Some(rate));
+
+        // Simulate 2 seconds of a sender that always has data.
+        let mut now = start;
+        let mut sent = 0u64;
+        while now < start + Duration::from_secs(2) {
+            match pacer.delay(Duration::from_millis(50), u64::from(mtu), mtu, 100_000, now) {
+                None => {
+                    pacer.on_transmit(mtu);
+                    sent += u64::from(mtu);
+                }
+                Some(next) => now = next,
+            }
+        }
+        let expected = rate * 2;
+        // The bucket holds max(4 ms of data, MIN_BURST_SIZE packets), so allow for the larger one.
+        let burst = (rate * 4 / 1000).max(10 * u64::from(mtu));
+        assert!(
+            sent.abs_diff(expected) <= burst + u64::from(mtu),
+            "sent {sent}, expected about {expected}"
+        );
+    }
 
     #[test]
     fn does_not_panic_on_bad_instant() {
