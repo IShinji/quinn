@@ -65,6 +65,16 @@ pub trait Controller: Send + Sync {
     /// Number of ack-eliciting bytes that may be in flight
     fn window(&self) -> u64;
 
+    /// Fixed pacing rate in bytes per second
+    ///
+    /// When `Some`, the pacer ignores the default `window / RTT * 1.25` rule and releases packets at
+    /// exactly this rate. Controllers that decide their sending rate directly (for example a fixed
+    /// rate controller such as Hysteria's Brutal) need this; window based controllers keep the
+    /// default `None`.
+    fn pacing_rate(&self) -> Option<u64> {
+        None
+    }
+
     /// Retrieve implementation-specific metrics used to populate `qlog` traces when they are enabled
     fn metrics(&self) -> ControllerMetrics {
         ControllerMetrics {
