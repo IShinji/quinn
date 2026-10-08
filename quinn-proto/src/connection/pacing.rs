@@ -223,7 +223,8 @@ mod tests {
             }
         }
         let expected = rate * 2;
-        let burst = rate * 4 / 1000;
+        // The bucket holds max(4 ms of data, MIN_BURST_SIZE packets), so allow for the larger one.
+        let burst = (rate * 4 / 1000).max(10 * u64::from(mtu));
         assert!(
             sent.abs_diff(expected) <= burst + u64::from(mtu),
             "sent {sent}, expected about {expected}"
